@@ -15,8 +15,8 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Knowledge Base Builder",
-  description: "YouTube Transcript Extraction + Google Docs",
+  title: "Knowledge Base Builder | Dillon Moses",
+  description: "YouTube Transcript Extraction + Google Docs by Dillon Moses",
 };
 
 export default function RootLayout({
