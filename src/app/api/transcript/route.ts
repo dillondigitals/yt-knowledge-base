@@ -55,36 +55,63 @@ function parseJson3Captions(json: string): string {
   return (segments || []).join("").replace(/\n/g, " ").trim();
 }
 
-async function fetchCaptionText(videoId: string): Promise<string> {
-  // Strategy: fetch the YouTube watch page HTML to extract caption track URLs
-  // These URLs are signed for the requesting IP so they actually work
-  // Use CONSENT cookie to bypass YouTube's cookie consent wall (affects EU/server IPs)
+async function fetchYouTubePage(videoId: string): Promise<string> {
+  const headers: Record<string, string> = {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    Accept: "text/html,application/xhtml+xml",
+    "Cookie":
+      "CONSENT=PENDING+987; SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnSmgY",
+  };
+
+  // First request to get session cookies
+  const initRes = await fetch("https://www.youtube.com/", {
+    headers,
+    redirect: "follow",
+  });
+
+  // Collect set-cookie headers from initial request
+  const setCookies = initRes.headers.getSetCookie?.() || [];
+  const cookieJar = setCookies
+    .map((c: string) => c.split(";")[0])
+    .join("; ");
+
+  // Merge cookies
+  const allCookies = [
+    headers["Cookie"],
+    cookieJar,
+  ]
+    .filter(Boolean)
+    .join("; ");
+
+  // Now fetch the actual video page with all cookies
   const pageRes = await fetch(
-    `https://www.youtube.com/watch?v=${videoId}&hl=en`,
+    `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US`,
     {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cookie": "CONSENT=YES+cb.20210328-17-p0.en+FX+634; SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnSmgY",
+        ...headers,
+        Cookie: allCookies,
       },
       redirect: "follow",
     }
   );
 
   if (!pageRes.ok) {
-    throw new Error("Failed to fetch video page");
+    throw new Error(`Failed to fetch video page (${pageRes.status})`);
   }
 
-  const html = await pageRes.text();
+  return pageRes.text();
+}
+
+async function fetchCaptionText(videoId: string): Promise<string> {
+  const html = await fetchYouTubePage(videoId);
 
   // Extract caption tracks from the player response JSON embedded in the HTML
-  // Handle escaped unicode in URLs
   const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
   if (!captionTracksMatch) {
-    // Debug: check if we got a consent page
-    if (html.includes("consent") || html.includes("CONSENT")) {
-      throw new Error("YouTube consent wall - retry needed");
+    if (html.includes("consent.youtube") || html.includes("CONSENT")) {
+      throw new Error("YouTube consent wall blocked access");
     }
     throw new Error("No captions available for this video");
   }
@@ -117,8 +144,12 @@ async function fetchCaptionText(videoId: string): Promise<string> {
   }
 
   // Fetch the caption content - try JSON3 first, fall back to XML
+  const fetchHeaders = {
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  };
   const json3Url = track.baseUrl + "&fmt=json3";
-  const json3Res = await fetch(json3Url);
+  const json3Res = await fetch(json3Url, { headers: fetchHeaders });
 
   if (json3Res.ok) {
     const body = await json3Res.text();
@@ -128,7 +159,7 @@ async function fetchCaptionText(videoId: string): Promise<string> {
   }
 
   // Fall back to default XML format
-  const xmlRes = await fetch(track.baseUrl);
+  const xmlRes = await fetch(track.baseUrl, { headers: fetchHeaders });
   if (xmlRes.ok) {
     const body = await xmlRes.text();
     if (body.length > 0 && body.startsWith("<?xml")) {
