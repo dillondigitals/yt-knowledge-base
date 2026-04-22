@@ -56,42 +56,15 @@ function parseJson3Captions(json: string): string {
 }
 
 async function fetchYouTubePage(videoId: string): Promise<string> {
-  const headers: Record<string, string> = {
-    "User-Agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-    Accept: "text/html,application/xhtml+xml",
-    "Cookie":
-      "CONSENT=PENDING+987; SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnSmgY",
-  };
-
-  // First request to get session cookies
-  const initRes = await fetch("https://www.youtube.com/", {
-    headers,
-    redirect: "follow",
-  });
-
-  // Collect set-cookie headers from initial request
-  const setCookies = initRes.headers.getSetCookie?.() || [];
-  const cookieJar = setCookies
-    .map((c: string) => c.split(";")[0])
-    .join("; ");
-
-  // Merge cookies
-  const allCookies = [
-    headers["Cookie"],
-    cookieJar,
-  ]
-    .filter(Boolean)
-    .join("; ");
-
-  // Now fetch the actual video page with all cookies
+  // Use ucbcb=1 parameter to bypass YouTube's cookie consent wall
+  // This works from all server environments including cloud functions
   const pageRes = await fetch(
-    `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US`,
+    `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US&ucbcb=1`,
     {
       headers: {
-        ...headers,
-        Cookie: allCookies,
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
       },
       redirect: "follow",
     }
