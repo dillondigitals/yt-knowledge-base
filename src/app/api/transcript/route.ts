@@ -29,10 +29,6 @@ function decodeHtmlEntities(text: string): string {
     .trim();
 }
 
-async function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function parseXmlCaptions(xml: string): string {
   const segments: string[] = [];
   const textRegex = /<text[^>]*>([\s\S]*?)<\/text>/g;
@@ -55,9 +51,8 @@ function parseJson3Captions(json: string): string {
   return (segments || []).join("").replace(/\n/g, " ").trim();
 }
 
-async function fetchYouTubePage(videoId: string): Promise<string> {
-  // Use ucbcb=1 parameter to bypass YouTube's cookie consent wall
-  // This works from all server environments including cloud functions
+async function fetchCaptionText(videoId: string): Promise<string> {
+  // Strategy 1: Fetch the watch page with consent bypass and extract signed caption URLs
   const pageRes = await fetch(
     `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US&ucbcb=1`,
     {
@@ -74,84 +69,107 @@ async function fetchYouTubePage(videoId: string): Promise<string> {
     throw new Error(`Failed to fetch video page (${pageRes.status})`);
   }
 
-  return pageRes.text();
-}
+  const html = await pageRes.text();
 
-async function fetchCaptionText(videoId: string): Promise<string> {
-  const html = await fetchYouTubePage(videoId);
-
-  // Extract caption tracks from the player response JSON embedded in the HTML
+  // Try to extract caption tracks from the player response
   const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
-  if (!captionTracksMatch) {
-    // Check if we got redirected to consent page instead of video page
-    if (html.includes("consent.youtube.com") && !html.includes("ytInitialPlayerResponse")) {
-      throw new Error("YouTube consent wall blocked access");
-    }
-    // Check if the page loaded but the video has no captions
-    if (html.includes("ytInitialPlayerResponse")) {
-      throw new Error("No captions available for this video");
-    }
-    // Unknown page content - dump a snippet for debugging
-    const snippet = html.substring(0, 500).replace(/\n/g, " ");
-    throw new Error(`Unexpected page content: ${snippet.substring(0, 200)}`);
-  }
+  if (captionTracksMatch) {
+    try {
+      const rawJson = captionTracksMatch[1]
+        .replace(/\\u0026/g, "&")
+        .replace(/\\"/g, '"');
+      const tracks = JSON.parse(rawJson);
 
-  let tracks;
-  try {
-    // YouTube escapes special chars in HTML - unescape them
-    const rawJson = captionTracksMatch[1].replace(/\\u0026/g, "&").replace(/\\"/g, '"');
-    tracks = JSON.parse(rawJson);
-  } catch {
-    throw new Error("Failed to parse caption tracks");
-  }
+      if (tracks && tracks.length > 0) {
+        // Prefer English manual captions, then English ASR, then first
+        const enManual = tracks.find(
+          (t: { languageCode: string; kind?: string }) =>
+            t.languageCode === "en" && t.kind !== "asr"
+        );
+        const enAsr = tracks.find(
+          (t: { languageCode: string }) => t.languageCode === "en"
+        );
+        const track = enManual || enAsr || tracks[0];
 
-  if (!tracks || tracks.length === 0) {
-    throw new Error("No captions available for this video");
-  }
+        if (track?.baseUrl) {
+          // Try fetching caption content
+          const fetchHeaders = {
+            "User-Agent":
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+          };
 
-  // Prefer English manual captions, then English ASR, then first available
-  const enManual = tracks.find(
-    (t: { languageCode: string; kind?: string }) =>
-      t.languageCode === "en" && t.kind !== "asr"
-  );
-  const enAsr = tracks.find(
-    (t: { languageCode: string }) => t.languageCode === "en"
-  );
-  const track = enManual || enAsr || tracks[0];
+          // Try JSON3 format first
+          const json3Res = await fetch(track.baseUrl + "&fmt=json3", {
+            headers: fetchHeaders,
+          });
+          if (json3Res.ok) {
+            const body = await json3Res.text();
+            if (body.length > 0 && body.startsWith("{")) {
+              return parseJson3Captions(body);
+            }
+          }
 
-  if (!track?.baseUrl) {
-    throw new Error("Caption track URL not found");
-  }
-
-  // Fetch the caption content - try JSON3 first, fall back to XML
-  const fetchHeaders = {
-    "User-Agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  };
-  const json3Url = track.baseUrl + "&fmt=json3";
-  const json3Res = await fetch(json3Url, { headers: fetchHeaders });
-
-  if (json3Res.ok) {
-    const body = await json3Res.text();
-    if (body.length > 0 && body.startsWith("{")) {
-      return parseJson3Captions(body);
+          // Try XML format
+          const xmlRes = await fetch(track.baseUrl, {
+            headers: fetchHeaders,
+          });
+          if (xmlRes.ok) {
+            const body = await xmlRes.text();
+            if (body.includes("<text")) {
+              return parseXmlCaptions(body);
+            }
+          }
+        }
+      }
+    } catch {
+      // Fall through to Strategy 2
     }
   }
 
-  // Fall back to default XML format
-  const xmlRes = await fetch(track.baseUrl, { headers: fetchHeaders });
-  if (xmlRes.ok) {
-    const body = await xmlRes.text();
-    if (body.length > 0 && body.startsWith("<?xml")) {
-      return parseXmlCaptions(body);
-    }
-    // Sometimes it's XML without the declaration
-    if (body.includes("<text")) {
-      return parseXmlCaptions(body);
+  // Strategy 2: Use the unsigned timedtext endpoint
+  // This works when the watch page doesn't include caption URLs (cloud IPs)
+  const formats = ["json3", "srv3", ""];
+  const kinds = ["asr", ""];
+  const langs = ["en", "en-US"];
+
+  for (const lang of langs) {
+    for (const kind of kinds) {
+      for (const fmt of formats) {
+        const params = new URLSearchParams({
+          v: videoId,
+          lang,
+        });
+        if (kind) params.set("kind", kind);
+        if (fmt) params.set("fmt", fmt);
+
+        const url = `https://video.google.com/timedtext?${params.toString()}`;
+        try {
+          const res = await fetch(url, {
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            },
+          });
+
+          if (res.ok) {
+            const body = await res.text();
+            if (body.length > 100) {
+              if (body.startsWith("{")) {
+                return parseJson3Captions(body);
+              }
+              if (body.includes("<text")) {
+                return parseXmlCaptions(body);
+              }
+            }
+          }
+        } catch {
+          continue;
+        }
+      }
     }
   }
 
-  throw new Error("Failed to download captions");
+  throw new Error("No captions available for this video");
 }
 
 export async function POST(request: NextRequest) {
@@ -164,7 +182,10 @@ export async function POST(request: NextRequest) {
 
     if (!YOUTUBE_API_KEY) {
       return NextResponse.json(
-        { error: "YouTube API key not configured. Set YOUTUBE_API_KEY in .env.local" },
+        {
+          error:
+            "YouTube API key not configured. Set YOUTUBE_API_KEY in .env.local",
+        },
         { status: 500 }
       );
     }
@@ -177,7 +198,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Get video metadata via YouTube Data API v3 (reliable, uses API key)
+    // Get video metadata via YouTube Data API v3
     const youtube = google.youtube({ version: "v3", auth: YOUTUBE_API_KEY });
     const videoRes = await youtube.videos.list({
       part: ["snippet", "contentDetails"],
@@ -194,8 +215,7 @@ export async function POST(request: NextRequest) {
     const publishedAt = videoInfo.snippet?.publishedAt || "";
     const duration = videoInfo.contentDetails?.duration || "";
 
-    // Get transcript by fetching the watch page and extracting caption URLs
-    // The URLs are signed for the server's IP so they work from any environment
+    // Get transcript using multiple strategies
     const transcript = await fetchCaptionText(videoId);
 
     if (!transcript || transcript.length === 0) {
