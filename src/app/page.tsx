@@ -76,68 +76,50 @@ function now() {
   return new Date().toLocaleTimeString();
 }
 
-async function fetchCaptionsFromBrowser(videoId: string): Promise<string> {
-  // Fetch captions directly from the user's browser
-  // The browser has a residential IP and YouTube cookies, so it won't be blocked
-  // We use a hidden iframe approach to get the watch page data
+const CAPTION_PROXY = process.env.NEXT_PUBLIC_CAPTION_PROXY || "";
 
-  // Try the timedtext endpoint directly from the browser
-  const formats = ["json3", ""];
-  const kinds = ["asr", ""];
-  const langs = ["en"];
+function decodeHtmlEntities(text: string): string {
+  return text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\n/g, " ").trim();
+}
 
-  for (const lang of langs) {
-    for (const kind of kinds) {
-      for (const fmt of formats) {
-        const params = new URLSearchParams({ v: videoId, lang });
-        if (kind) params.set("kind", kind);
-        if (fmt) params.set("fmt", fmt);
+function parseJson3(body: string): string {
+  const data = JSON.parse(body);
+  const segs = data.events
+    ?.filter((e: { segs?: Array<{ utf8: string }> }) => e.segs)
+    .flatMap((e: { segs: Array<{ utf8: string }> }) => e.segs.map((s: { utf8: string }) => s.utf8))
+    .filter((t: string) => t && t.trim() !== "\n");
+  return (segs || []).join("").replace(/\n/g, " ").trim();
+}
 
-        const url = `https://www.youtube.com/api/timedtext?${params.toString()}`;
-        try {
-          const res = await fetch(url, { credentials: "include" });
-          if (!res.ok) continue;
-          const body = await res.text();
-          if (body.length < 50) continue;
-
-          if (body.startsWith("{")) {
-            // JSON3 format
-            const data = JSON.parse(body);
-            const segments = data.events
-              ?.filter((e: { segs?: Array<{ utf8: string }> }) => e.segs)
-              .flatMap((e: { segs: Array<{ utf8: string }> }) =>
-                e.segs.map((s: { utf8: string }) => s.utf8)
-              )
-              .filter((t: string) => t && t.trim() !== "\n");
-            if (segments && segments.length > 0) {
-              return segments.join("").replace(/\n/g, " ").trim();
-            }
-          } else if (body.includes("<text")) {
-            // XML format
-            const segments: string[] = [];
-            const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-            let match;
-            while ((match = regex.exec(body)) !== null) {
-              const text = match[1]
-                .replace(/&amp;/g, "&")
-                .replace(/&lt;/g, "<")
-                .replace(/&gt;/g, ">")
-                .replace(/&quot;/g, '"')
-                .replace(/&#39;/g, "'")
-                .replace(/\n/g, " ")
-                .trim();
-              if (text) segments.push(text);
-            }
-            if (segments.length > 0) return segments.join(" ");
-          }
-        } catch {
-          continue;
-        }
-      }
-    }
+function parseXml(body: string): string {
+  const segs: string[] = [];
+  const re = /<text[^>]*>([\s\S]*?)<\/text>/g;
+  let m;
+  while ((m = re.exec(body)) !== null) {
+    const t = decodeHtmlEntities(m[1]);
+    if (t) segs.push(t);
   }
+  return segs.join(" ");
+}
 
-  return "";
+async function fetchCaptionViaProxy(videoId: string): Promise<string> {
+  if (!CAPTION_PROXY) return "";
+  try {
+    const res = await fetch(`${CAPTION_PROXY}?v=${videoId}&lang=en`, {
+      credentials: "include",
+      redirect: "follow",
+    });
+    if (!res.ok) return "";
+    const data = await res.json();
+    if (data.error) return "";
+    const body = data.transcript || "";
+    if (body.length < 50) return "";
+    if (data.format === "json3" || body.startsWith("{")) return parseJson3(body);
+    if (body.includes("<text")) return parseXml(body);
+    return body;
+  } catch {
+    return "";
+  }
 }
 
 export default function KnowledgeBaseApp() {
@@ -250,14 +232,28 @@ export default function KnowledgeBaseApp() {
       }
       processed++;
       try {
-        // Step 1: Get video metadata from server
+        // Extract video ID for proxy fetch
+        const vidMatch = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+        const videoId = vidMatch ? vidMatch[1] : "";
+
+        // Try browser-side proxy first (user's Google session)
+        let clientTranscript = "";
+        if (videoId && CAPTION_PROXY) {
+          clientTranscript = await fetchCaptionViaProxy(videoId);
+        }
+
+        // Send to server (with or without transcript)
         const res = await fetch("/api/transcript", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url }),
+          body: JSON.stringify(
+            clientTranscript
+              ? { url, transcript: clientTranscript }
+              : { url }
+          ),
         });
 
-        let data = await res.json();
+        const data = await res.json();
 
         if (data.error) {
           setBuildLog((prev) => [
@@ -265,43 +261,6 @@ export default function KnowledgeBaseApp() {
             { time: now(), msg: `[${processed}/${urls.length}] Failed: ${data.error}`, type: "error" },
           ]);
           hasError = true;
-        } else if (data.needsClientFetch && data.videoId) {
-          // Step 2: Fetch captions from the browser (residential IP, no blocks)
-          try {
-            const transcript = await fetchCaptionsFromBrowser(data.videoId);
-            if (transcript && transcript.length > 0) {
-              // Step 3: Send transcript back to server with metadata
-              const res2 = await fetch("/api/transcript", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url, transcript }),
-              });
-              data = await res2.json();
-
-              const chars = data.transcript?.length || 0;
-              totalChars += chars;
-              setBuildLog((prev) => [
-                ...prev,
-                {
-                  time: now(),
-                  msg: `[${processed}/${urls.length}] ${data.title || "Untitled"} \u2014 ${chars.toLocaleString()} chars`,
-                  type: "success",
-                },
-              ]);
-            } else {
-              setBuildLog((prev) => [
-                ...prev,
-                { time: now(), msg: `[${processed}/${urls.length}] ${data.title || "Untitled"} \u2014 no captions available`, type: "error" },
-              ]);
-              hasError = true;
-            }
-          } catch (clientErr) {
-            setBuildLog((prev) => [
-              ...prev,
-              { time: now(), msg: `[${processed}/${urls.length}] ${data.title || "Untitled"} \u2014 caption fetch failed`, type: "error" },
-            ]);
-            hasError = true;
-          }
         } else {
           const chars = data.transcript?.length || 0;
           totalChars += chars;
