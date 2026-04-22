@@ -172,6 +172,10 @@ export default function KnowledgeBaseApp() {
     let hasError = false;
 
     for (const url of urls) {
+      // Small delay between requests to avoid YouTube rate limiting
+      if (processed > 0) {
+        await new Promise((r) => setTimeout(r, 1500));
+      }
       processed++;
       try {
         const res = await fetch("/api/transcript", {

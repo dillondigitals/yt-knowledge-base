@@ -1,43 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
+import { google } from "googleapis";
 
-async function getChannelVideos(channelInput: string): Promise<string[]> {
-  // Resolve channel URL to get the videos page
-  let channelUrl: string;
-
-  if (channelInput.startsWith("@")) {
-    channelUrl = `https://www.youtube.com/${channelInput}/videos`;
-  } else if (channelInput.includes("youtube.com")) {
-    channelUrl = channelInput.replace(/\/$/, "");
-    if (!channelUrl.endsWith("/videos")) {
-      channelUrl += "/videos";
-    }
-  } else {
-    channelUrl = `https://www.youtube.com/@${channelInput}/videos`;
-  }
-
-  const res = await fetch(channelUrl, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-  const html = await res.text();
-
-  // Extract video IDs from the page's initial data
-  const videoIds = new Set<string>();
-
-  // Match video IDs from ytInitialData
-  const idPattern = /"videoId":"([a-zA-Z0-9_-]{11})"/g;
-  let match;
-  while ((match = idPattern.exec(html)) !== null) {
-    videoIds.add(match[1]);
-  }
-
-  return Array.from(videoIds).map(
-    (id) => `https://www.youtube.com/watch?v=${id}`
-  );
-}
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
 
 export async function POST(request: NextRequest) {
   try {
@@ -50,7 +14,82 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const urls = await getChannelVideos(channel);
+    if (!YOUTUBE_API_KEY) {
+      return NextResponse.json(
+        { error: "YouTube API key not configured. Set YOUTUBE_API_KEY in .env.local" },
+        { status: 500 }
+      );
+    }
+
+    const youtube = google.youtube({ version: "v3", auth: YOUTUBE_API_KEY });
+
+    // Extract handle from various input formats
+    let handle = channel.trim();
+    if (handle.includes("youtube.com/")) {
+      const match = handle.match(/youtube\.com\/(@[\w.-]+)/);
+      if (match) handle = match[1];
+    }
+    if (handle.startsWith("@")) {
+      handle = handle.substring(1);
+    }
+
+    // Search for the channel by handle
+    const searchRes = await youtube.search.list({
+      part: ["snippet"],
+      q: handle,
+      type: ["channel"],
+      maxResults: 1,
+    });
+
+    const channelResult = searchRes.data.items?.[0];
+    if (!channelResult?.snippet?.channelId) {
+      return NextResponse.json(
+        { error: "Channel not found" },
+        { status: 404 }
+      );
+    }
+
+    const channelId = channelResult.snippet.channelId;
+
+    // Get all video uploads from the channel
+    // First, get the uploads playlist ID
+    const channelRes = await youtube.channels.list({
+      part: ["contentDetails"],
+      id: [channelId],
+    });
+
+    const uploadsPlaylistId =
+      channelRes.data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+
+    if (!uploadsPlaylistId) {
+      return NextResponse.json(
+        { error: "Could not find uploads playlist" },
+        { status: 404 }
+      );
+    }
+
+    // Fetch all videos from uploads playlist (paginated)
+    const urls: string[] = [];
+    let nextPageToken: string | undefined;
+
+    do {
+      const playlistRes = await youtube.playlistItems.list({
+        part: ["contentDetails"],
+        playlistId: uploadsPlaylistId,
+        maxResults: 50,
+        pageToken: nextPageToken,
+      });
+
+      const items = playlistRes.data.items || [];
+      for (const item of items) {
+        const videoId = item.contentDetails?.videoId;
+        if (videoId) {
+          urls.push(`https://www.youtube.com/watch?v=${videoId}`);
+        }
+      }
+
+      nextPageToken = playlistRes.data.nextPageToken || undefined;
+    } while (nextPageToken && urls.length < 500);
 
     if (urls.length === 0) {
       return NextResponse.json(
@@ -59,9 +98,15 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    return NextResponse.json({ urls, count: urls.length });
+    return NextResponse.json({
+      channelId,
+      channelName: channelResult.snippet.title,
+      urls,
+      count: urls.length,
+    });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("Channel error:", message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
