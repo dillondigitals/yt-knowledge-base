@@ -58,14 +58,17 @@ function parseJson3Captions(json: string): string {
 async function fetchCaptionText(videoId: string): Promise<string> {
   // Strategy: fetch the YouTube watch page HTML to extract caption track URLs
   // These URLs are signed for the requesting IP so they actually work
+  // Use CONSENT cookie to bypass YouTube's cookie consent wall (affects EU/server IPs)
   const pageRes = await fetch(
-    `https://www.youtube.com/watch?v=${videoId}`,
+    `https://www.youtube.com/watch?v=${videoId}&hl=en`,
     {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": "CONSENT=YES+cb.20210328-17-p0.en+FX+634; SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnSmgY",
       },
+      redirect: "follow",
     }
   );
 
@@ -76,14 +79,21 @@ async function fetchCaptionText(videoId: string): Promise<string> {
   const html = await pageRes.text();
 
   // Extract caption tracks from the player response JSON embedded in the HTML
+  // Handle escaped unicode in URLs
   const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
   if (!captionTracksMatch) {
+    // Debug: check if we got a consent page
+    if (html.includes("consent") || html.includes("CONSENT")) {
+      throw new Error("YouTube consent wall - retry needed");
+    }
     throw new Error("No captions available for this video");
   }
 
   let tracks;
   try {
-    tracks = JSON.parse(captionTracksMatch[1]);
+    // YouTube escapes special chars in HTML - unescape them
+    const rawJson = captionTracksMatch[1].replace(/\\u0026/g, "&").replace(/\\"/g, '"');
+    tracks = JSON.parse(rawJson);
   } catch {
     throw new Error("Failed to parse caption tracks");
   }
