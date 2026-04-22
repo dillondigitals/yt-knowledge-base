@@ -83,10 +83,17 @@ async function fetchCaptionText(videoId: string): Promise<string> {
   // Extract caption tracks from the player response JSON embedded in the HTML
   const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
   if (!captionTracksMatch) {
-    if (html.includes("consent.youtube") || html.includes("CONSENT")) {
+    // Check if we got redirected to consent page instead of video page
+    if (html.includes("consent.youtube.com") && !html.includes("ytInitialPlayerResponse")) {
       throw new Error("YouTube consent wall blocked access");
     }
-    throw new Error("No captions available for this video");
+    // Check if the page loaded but the video has no captions
+    if (html.includes("ytInitialPlayerResponse")) {
+      throw new Error("No captions available for this video");
+    }
+    // Unknown page content - dump a snippet for debugging
+    const snippet = html.substring(0, 500).replace(/\n/g, " ");
+    throw new Error(`Unexpected page content: ${snippet.substring(0, 200)}`);
   }
 
   let tracks;
