@@ -57,90 +57,149 @@ async function fetchCaptionWithAuth(
   videoId: string,
   accessToken: string
 ): Promise<string> {
-  // Use the InnerTube player API with OAuth token
-  // This returns caption track URLs signed for the authenticated user
-  const playerRes = await fetch(
-    `https://www.youtube.com/youtubei/v1/player?key=${YOUTUBE_API_KEY}&prettyPrint=false`,
+  // Use YouTube Data API with OAuth2 to get caption track details
+  const client = createOAuth2Client();
+  client.setCredentials({ access_token: accessToken });
+  const youtube = google.youtube({ version: "v3", auth: client });
+
+  // List caption tracks for this video (OAuth2 gives more access than API key)
+  const captionsRes = await youtube.captions.list({
+    part: ["snippet"],
+    videoId,
+  });
+
+  const tracks = captionsRes.data.items || [];
+  if (tracks.length === 0) {
+    throw new Error("No caption tracks found via API");
+  }
+
+  // Find the best English track
+  const enManual = tracks.find(
+    (t) => t.snippet?.language === "en" && t.snippet?.trackKind !== "ASR"
+  );
+  const enAsr = tracks.find((t) => t.snippet?.language === "en");
+  const track = enManual || enAsr || tracks[0];
+  const lang = track?.snippet?.language || "en";
+  const kind = track?.snippet?.trackKind === "ASR" ? "asr" : "";
+
+  // Try multiple approaches to fetch the actual caption text
+
+  // Approach 1: timedtext endpoint with OAuth Bearer token
+  const timedtextParams = new URLSearchParams({
+    v: videoId,
+    lang,
+    fmt: "json3",
+  });
+  if (kind) timedtextParams.set("kind", kind);
+
+  for (const host of [
+    "www.youtube.com",
+    "video.google.com",
+  ]) {
+    const url = `https://${host}/api/timedtext?${timedtextParams.toString()}`;
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        },
+      });
+      if (res.ok) {
+        const body = await res.text();
+        if (body.length > 100 && body.startsWith("{")) {
+          return parseJson3Captions(body);
+        }
+      }
+    } catch {
+      continue;
+    }
+
+    // Try XML format
+    timedtextParams.delete("fmt");
+    const xmlUrl = `https://${host}/api/timedtext?${timedtextParams.toString()}`;
+    try {
+      const res = await fetch(xmlUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": "Mozilla/5.0",
+        },
+      });
+      if (res.ok) {
+        const body = await res.text();
+        if (body.includes("<text")) {
+          return parseXmlCaptions(body);
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  // Approach 2: Fetch the watch page with auth cookie exchange
+  // Use the access token to get a YouTube page with full player response
+  const pageRes = await fetch(
+    `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US&ucbcb=1`,
     {
-      method: "POST",
       headers: {
-        "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
         "User-Agent":
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
       },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName: "WEB",
-            clientVersion: "2.20260421.00.00",
-            hl: "en",
-            gl: "US",
+      redirect: "follow",
+    }
+  );
+
+  if (pageRes.ok) {
+    const html = await pageRes.text();
+    const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
+    if (captionTracksMatch) {
+      const rawJson = captionTracksMatch[1]
+        .replace(/\\u0026/g, "&")
+        .replace(/\\"/g, '"');
+      const pageTracks = JSON.parse(rawJson);
+      const enTrack =
+        pageTracks.find(
+          (t: { languageCode: string; kind?: string }) =>
+            t.languageCode === "en" && t.kind !== "asr"
+        ) ||
+        pageTracks.find(
+          (t: { languageCode: string }) => t.languageCode === "en"
+        ) ||
+        pageTracks[0];
+
+      if (enTrack?.baseUrl) {
+        const captionRes = await fetch(enTrack.baseUrl + "&fmt=json3", {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "User-Agent": "Mozilla/5.0",
           },
-        },
-      }),
-    }
-  );
-
-  if (!playerRes.ok) {
-    throw new Error(`Player API returned ${playerRes.status}`);
-  }
-
-  const playerData = await playerRes.json();
-  const captionTracks =
-    playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-
-  if (!captionTracks || captionTracks.length === 0) {
-    throw new Error("No captions available");
-  }
-
-  // Prefer English manual, then English ASR, then first
-  const enManual = captionTracks.find(
-    (t: { languageCode: string; kind?: string }) =>
-      t.languageCode === "en" && t.kind !== "asr"
-  );
-  const enAsr = captionTracks.find(
-    (t: { languageCode: string }) => t.languageCode === "en"
-  );
-  const track = enManual || enAsr || captionTracks[0];
-
-  if (!track?.baseUrl) {
-    throw new Error("No caption URL found");
-  }
-
-  // Fetch the caption content with auth
-  const captionRes = await fetch(track.baseUrl + "&fmt=json3", {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    },
-  });
-
-  if (captionRes.ok) {
-    const body = await captionRes.text();
-    if (body.length > 0 && body.startsWith("{")) {
-      return parseJson3Captions(body);
+        });
+        if (captionRes.ok) {
+          const body = await captionRes.text();
+          if (body.length > 100 && body.startsWith("{")) {
+            return parseJson3Captions(body);
+          }
+        }
+        // Try without fmt
+        const xmlRes = await fetch(enTrack.baseUrl, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "User-Agent": "Mozilla/5.0",
+          },
+        });
+        if (xmlRes.ok) {
+          const body = await xmlRes.text();
+          if (body.includes("<text")) {
+            return parseXmlCaptions(body);
+          }
+        }
+      }
     }
   }
 
-  // Try XML format
-  const xmlRes = await fetch(track.baseUrl, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": "Mozilla/5.0",
-    },
-  });
-
-  if (xmlRes.ok) {
-    const body = await xmlRes.text();
-    if (body.includes("<text")) {
-      return parseXmlCaptions(body);
-    }
-  }
-
-  throw new Error("Failed to download caption content");
+  throw new Error("Failed to download captions with auth");
 }
 
 async function fetchCaptionUnauthenticated(videoId: string): Promise<string> {
