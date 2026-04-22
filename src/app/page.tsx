@@ -76,6 +76,70 @@ function now() {
   return new Date().toLocaleTimeString();
 }
 
+async function fetchCaptionsFromBrowser(videoId: string): Promise<string> {
+  // Fetch captions directly from the user's browser
+  // The browser has a residential IP and YouTube cookies, so it won't be blocked
+  // We use a hidden iframe approach to get the watch page data
+
+  // Try the timedtext endpoint directly from the browser
+  const formats = ["json3", ""];
+  const kinds = ["asr", ""];
+  const langs = ["en"];
+
+  for (const lang of langs) {
+    for (const kind of kinds) {
+      for (const fmt of formats) {
+        const params = new URLSearchParams({ v: videoId, lang });
+        if (kind) params.set("kind", kind);
+        if (fmt) params.set("fmt", fmt);
+
+        const url = `https://www.youtube.com/api/timedtext?${params.toString()}`;
+        try {
+          const res = await fetch(url, { credentials: "include" });
+          if (!res.ok) continue;
+          const body = await res.text();
+          if (body.length < 50) continue;
+
+          if (body.startsWith("{")) {
+            // JSON3 format
+            const data = JSON.parse(body);
+            const segments = data.events
+              ?.filter((e: { segs?: Array<{ utf8: string }> }) => e.segs)
+              .flatMap((e: { segs: Array<{ utf8: string }> }) =>
+                e.segs.map((s: { utf8: string }) => s.utf8)
+              )
+              .filter((t: string) => t && t.trim() !== "\n");
+            if (segments && segments.length > 0) {
+              return segments.join("").replace(/\n/g, " ").trim();
+            }
+          } else if (body.includes("<text")) {
+            // XML format
+            const segments: string[] = [];
+            const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
+            let match;
+            while ((match = regex.exec(body)) !== null) {
+              const text = match[1]
+                .replace(/&amp;/g, "&")
+                .replace(/&lt;/g, "<")
+                .replace(/&gt;/g, ">")
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/\n/g, " ")
+                .trim();
+              if (text) segments.push(text);
+            }
+            if (segments.length > 0) return segments.join(" ");
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
 export default function KnowledgeBaseApp() {
   const [selectedCreator, setSelectedCreator] = useState<Creator>(CREATORS[0]);
   const [urlInput, setUrlInput] = useState("");
@@ -186,13 +250,14 @@ export default function KnowledgeBaseApp() {
       }
       processed++;
       try {
+        // Step 1: Get video metadata from server
         const res = await fetch("/api/transcript", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url }),
         });
 
-        const data = await res.json();
+        let data = await res.json();
 
         if (data.error) {
           setBuildLog((prev) => [
@@ -200,6 +265,43 @@ export default function KnowledgeBaseApp() {
             { time: now(), msg: `[${processed}/${urls.length}] Failed: ${data.error}`, type: "error" },
           ]);
           hasError = true;
+        } else if (data.needsClientFetch && data.videoId) {
+          // Step 2: Fetch captions from the browser (residential IP, no blocks)
+          try {
+            const transcript = await fetchCaptionsFromBrowser(data.videoId);
+            if (transcript && transcript.length > 0) {
+              // Step 3: Send transcript back to server with metadata
+              const res2 = await fetch("/api/transcript", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url, transcript }),
+              });
+              data = await res2.json();
+
+              const chars = data.transcript?.length || 0;
+              totalChars += chars;
+              setBuildLog((prev) => [
+                ...prev,
+                {
+                  time: now(),
+                  msg: `[${processed}/${urls.length}] ${data.title || "Untitled"} \u2014 ${chars.toLocaleString()} chars`,
+                  type: "success",
+                },
+              ]);
+            } else {
+              setBuildLog((prev) => [
+                ...prev,
+                { time: now(), msg: `[${processed}/${urls.length}] ${data.title || "Untitled"} \u2014 no captions available`, type: "error" },
+              ]);
+              hasError = true;
+            }
+          } catch (clientErr) {
+            setBuildLog((prev) => [
+              ...prev,
+              { time: now(), msg: `[${processed}/${urls.length}] ${data.title || "Untitled"} \u2014 caption fetch failed`, type: "error" },
+            ]);
+            hasError = true;
+          }
         } else {
           const chars = data.transcript?.length || 0;
           totalChars += chars;
