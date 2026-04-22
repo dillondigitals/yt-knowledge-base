@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { google } from "googleapis";
-import Innertube from "youtubei.js";
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
 
@@ -34,21 +33,104 @@ async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url: string, retries = 3): Promise<Response> {
-  for (let i = 0; i < retries; i++) {
-    const res = await fetch(url, {
+function parseXmlCaptions(xml: string): string {
+  const segments: string[] = [];
+  const textRegex = /<text[^>]*>([\s\S]*?)<\/text>/g;
+  let match;
+  while ((match = textRegex.exec(xml)) !== null) {
+    const text = decodeHtmlEntities(match[1]);
+    if (text) segments.push(text);
+  }
+  return segments.join(" ");
+}
+
+function parseJson3Captions(json: string): string {
+  const data = JSON.parse(json);
+  const segments = data.events
+    ?.filter((e: { segs?: Array<{ utf8: string }> }) => e.segs)
+    .flatMap((e: { segs: Array<{ utf8: string }> }) =>
+      e.segs.map((s: { utf8: string }) => s.utf8)
+    )
+    .filter((t: string) => t && t.trim() !== "\n");
+  return (segments || []).join("").replace(/\n/g, " ").trim();
+}
+
+async function fetchCaptionText(videoId: string): Promise<string> {
+  // Strategy: fetch the YouTube watch page HTML to extract caption track URLs
+  // These URLs are signed for the requesting IP so they actually work
+  const pageRes = await fetch(
+    `https://www.youtube.com/watch?v=${videoId}`,
+    {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
       },
-    });
-    if (res.status !== 429) return res;
-    // Wait before retrying (exponential backoff)
-    await sleep(2000 * (i + 1));
+    }
+  );
+
+  if (!pageRes.ok) {
+    throw new Error("Failed to fetch video page");
   }
-  // Last attempt
-  return fetch(url);
+
+  const html = await pageRes.text();
+
+  // Extract caption tracks from the player response JSON embedded in the HTML
+  const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
+  if (!captionTracksMatch) {
+    throw new Error("No captions available for this video");
+  }
+
+  let tracks;
+  try {
+    tracks = JSON.parse(captionTracksMatch[1]);
+  } catch {
+    throw new Error("Failed to parse caption tracks");
+  }
+
+  if (!tracks || tracks.length === 0) {
+    throw new Error("No captions available for this video");
+  }
+
+  // Prefer English manual captions, then English ASR, then first available
+  const enManual = tracks.find(
+    (t: { languageCode: string; kind?: string }) =>
+      t.languageCode === "en" && t.kind !== "asr"
+  );
+  const enAsr = tracks.find(
+    (t: { languageCode: string }) => t.languageCode === "en"
+  );
+  const track = enManual || enAsr || tracks[0];
+
+  if (!track?.baseUrl) {
+    throw new Error("Caption track URL not found");
+  }
+
+  // Fetch the caption content - try JSON3 first, fall back to XML
+  const json3Url = track.baseUrl + "&fmt=json3";
+  const json3Res = await fetch(json3Url);
+
+  if (json3Res.ok) {
+    const body = await json3Res.text();
+    if (body.length > 0 && body.startsWith("{")) {
+      return parseJson3Captions(body);
+    }
+  }
+
+  // Fall back to default XML format
+  const xmlRes = await fetch(track.baseUrl);
+  if (xmlRes.ok) {
+    const body = await xmlRes.text();
+    if (body.length > 0 && body.startsWith("<?xml")) {
+      return parseXmlCaptions(body);
+    }
+    // Sometimes it's XML without the declaration
+    if (body.includes("<text")) {
+      return parseXmlCaptions(body);
+    }
+  }
+
+  throw new Error("Failed to download captions");
 }
 
 export async function POST(request: NextRequest) {
@@ -61,10 +143,7 @@ export async function POST(request: NextRequest) {
 
     if (!YOUTUBE_API_KEY) {
       return NextResponse.json(
-        {
-          error:
-            "YouTube API key not configured. Set YOUTUBE_API_KEY in .env.local",
-        },
+        { error: "YouTube API key not configured. Set YOUTUBE_API_KEY in .env.local" },
         { status: 500 }
       );
     }
@@ -77,7 +156,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Get video metadata via YouTube Data API v3
+    // Get video metadata via YouTube Data API v3 (reliable, uses API key)
     const youtube = google.youtube({ version: "v3", auth: YOUTUBE_API_KEY });
     const videoRes = await youtube.videos.list({
       part: ["snippet", "contentDetails"],
@@ -94,93 +173,15 @@ export async function POST(request: NextRequest) {
     const publishedAt = videoInfo.snippet?.publishedAt || "";
     const duration = videoInfo.contentDetails?.duration || "";
 
-    // Get caption track URL via Innertube (youtubei.js)
-    // This gives us the signed timedtext URL
-    const yt = await Innertube.create({ lang: "en", location: "US" });
-    const info = await yt.getBasicInfo(videoId);
-    const captionTracks = info.captions?.caption_tracks;
+    // Get transcript by fetching the watch page and extracting caption URLs
+    // The URLs are signed for the server's IP so they work from any environment
+    const transcript = await fetchCaptionText(videoId);
 
-    if (!captionTracks || captionTracks.length === 0) {
+    if (!transcript || transcript.length === 0) {
       return NextResponse.json(
-        { error: "No captions available for this video" },
+        { error: "Captions returned empty for this video" },
         { status: 404 }
       );
-    }
-
-    // Prefer English standard captions, then any English, then first available
-    const enStandard = captionTracks.find(
-      (t) => t.language_code === "en" && t.kind !== "asr"
-    );
-    const enAny = captionTracks.find((t) => t.language_code === "en");
-    const track = enStandard || enAny || captionTracks[0];
-
-    if (!track.base_url) {
-      return NextResponse.json(
-        { error: "Caption track URL not found" },
-        { status: 404 }
-      );
-    }
-
-    // Fetch the caption content with retry logic
-    const captionRes = await fetchWithRetry(track.base_url + "&fmt=json3");
-
-    if (!captionRes.ok) {
-      // If timedtext is rate-limited, try the raw XML URL
-      const xmlRes = await fetchWithRetry(track.base_url);
-      if (!xmlRes.ok) {
-        return NextResponse.json(
-          {
-            error: `Captions temporarily unavailable (rate limited). Try again in a few minutes.`,
-          },
-          { status: 429 }
-        );
-      }
-
-      const xmlBody = await xmlRes.text();
-      const segments: string[] = [];
-      const textRegex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-      let match;
-      while ((match = textRegex.exec(xmlBody)) !== null) {
-        const text = decodeHtmlEntities(match[1]);
-        if (text) segments.push(text);
-      }
-
-      const transcript = segments.join(" ");
-      return NextResponse.json({
-        videoId,
-        title,
-        channelTitle,
-        publishedAt,
-        duration,
-        transcript,
-        url,
-        charCount: transcript.length,
-      });
-    }
-
-    const captionBody = await captionRes.text();
-
-    let transcript = "";
-    if (captionBody.startsWith("{")) {
-      // JSON3 format
-      const ttData = JSON.parse(captionBody);
-      const segments = ttData.events
-        ?.filter((e: { segs?: Array<{ utf8: string }> }) => e.segs)
-        .flatMap((e: { segs: Array<{ utf8: string }> }) =>
-          e.segs.map((s: { utf8: string }) => s.utf8)
-        )
-        .filter((t: string) => t && t.trim() !== "\n");
-      transcript = (segments || []).join("").replace(/\n/g, " ").trim();
-    } else {
-      // XML format
-      const segments: string[] = [];
-      const textRegex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-      let match;
-      while ((match = textRegex.exec(captionBody)) !== null) {
-        const text = decodeHtmlEntities(match[1]);
-        if (text) segments.push(text);
-      }
-      transcript = segments.join(" ");
     }
 
     return NextResponse.json({
