@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { google } from "googleapis";
+import { getSession } from "@/lib/session";
+import { createOAuth2Client, refreshAccessToken } from "@/lib/auth";
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
 
@@ -51,8 +53,98 @@ function parseJson3Captions(json: string): string {
   return (segments || []).join("").replace(/\n/g, " ").trim();
 }
 
-async function fetchCaptionText(videoId: string): Promise<string> {
-  // Strategy 1: Fetch the watch page with consent bypass and extract signed caption URLs
+async function fetchCaptionWithAuth(
+  videoId: string,
+  accessToken: string
+): Promise<string> {
+  // Use the InnerTube player API with OAuth token
+  // This returns caption track URLs signed for the authenticated user
+  const playerRes = await fetch(
+    `https://www.youtube.com/youtubei/v1/player?key=${YOUTUBE_API_KEY}&prettyPrint=false`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: "WEB",
+            clientVersion: "2.20260421.00.00",
+            hl: "en",
+            gl: "US",
+          },
+        },
+      }),
+    }
+  );
+
+  if (!playerRes.ok) {
+    throw new Error(`Player API returned ${playerRes.status}`);
+  }
+
+  const playerData = await playerRes.json();
+  const captionTracks =
+    playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
+  if (!captionTracks || captionTracks.length === 0) {
+    throw new Error("No captions available");
+  }
+
+  // Prefer English manual, then English ASR, then first
+  const enManual = captionTracks.find(
+    (t: { languageCode: string; kind?: string }) =>
+      t.languageCode === "en" && t.kind !== "asr"
+  );
+  const enAsr = captionTracks.find(
+    (t: { languageCode: string }) => t.languageCode === "en"
+  );
+  const track = enManual || enAsr || captionTracks[0];
+
+  if (!track?.baseUrl) {
+    throw new Error("No caption URL found");
+  }
+
+  // Fetch the caption content with auth
+  const captionRes = await fetch(track.baseUrl + "&fmt=json3", {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    },
+  });
+
+  if (captionRes.ok) {
+    const body = await captionRes.text();
+    if (body.length > 0 && body.startsWith("{")) {
+      return parseJson3Captions(body);
+    }
+  }
+
+  // Try XML format
+  const xmlRes = await fetch(track.baseUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "User-Agent": "Mozilla/5.0",
+    },
+  });
+
+  if (xmlRes.ok) {
+    const body = await xmlRes.text();
+    if (body.includes("<text")) {
+      return parseXmlCaptions(body);
+    }
+  }
+
+  throw new Error("Failed to download caption content");
+}
+
+async function fetchCaptionUnauthenticated(videoId: string): Promise<string> {
+  // Fallback: try watch page scraping + timedtext
   const pageRes = await fetch(
     `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US&ucbcb=1`,
     {
@@ -65,111 +157,46 @@ async function fetchCaptionText(videoId: string): Promise<string> {
     }
   );
 
-  if (!pageRes.ok) {
-    throw new Error(`Failed to fetch video page (${pageRes.status})`);
-  }
-
+  if (!pageRes.ok) throw new Error("Failed to fetch video page");
   const html = await pageRes.text();
 
-  // Try to extract caption tracks from the player response
   const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
-  if (captionTracksMatch) {
-    try {
-      const rawJson = captionTracksMatch[1]
-        .replace(/\\u0026/g, "&")
-        .replace(/\\"/g, '"');
-      const tracks = JSON.parse(rawJson);
-
-      if (tracks && tracks.length > 0) {
-        // Prefer English manual captions, then English ASR, then first
-        const enManual = tracks.find(
-          (t: { languageCode: string; kind?: string }) =>
-            t.languageCode === "en" && t.kind !== "asr"
-        );
-        const enAsr = tracks.find(
-          (t: { languageCode: string }) => t.languageCode === "en"
-        );
-        const track = enManual || enAsr || tracks[0];
-
-        if (track?.baseUrl) {
-          // Try fetching caption content
-          const fetchHeaders = {
-            "User-Agent":
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-          };
-
-          // Try JSON3 format first
-          const json3Res = await fetch(track.baseUrl + "&fmt=json3", {
-            headers: fetchHeaders,
-          });
-          if (json3Res.ok) {
-            const body = await json3Res.text();
-            if (body.length > 0 && body.startsWith("{")) {
-              return parseJson3Captions(body);
-            }
-          }
-
-          // Try XML format
-          const xmlRes = await fetch(track.baseUrl, {
-            headers: fetchHeaders,
-          });
-          if (xmlRes.ok) {
-            const body = await xmlRes.text();
-            if (body.includes("<text")) {
-              return parseXmlCaptions(body);
-            }
-          }
-        }
-      }
-    } catch {
-      // Fall through to Strategy 2
-    }
+  if (!captionTracksMatch) {
+    throw new Error("No captions found - sign in with Google for better results");
   }
 
-  // Strategy 2: Use the unsigned timedtext endpoint
-  // This works when the watch page doesn't include caption URLs (cloud IPs)
-  const formats = ["json3", "srv3", ""];
-  const kinds = ["asr", ""];
-  const langs = ["en", "en-US"];
+  const rawJson = captionTracksMatch[1]
+    .replace(/\\u0026/g, "&")
+    .replace(/\\"/g, '"');
+  const tracks = JSON.parse(rawJson);
+  const enTrack =
+    tracks.find(
+      (t: { languageCode: string; kind?: string }) =>
+        t.languageCode === "en" && t.kind !== "asr"
+    ) ||
+    tracks.find((t: { languageCode: string }) => t.languageCode === "en") ||
+    tracks[0];
 
-  for (const lang of langs) {
-    for (const kind of kinds) {
-      for (const fmt of formats) {
-        const params = new URLSearchParams({
-          v: videoId,
-          lang,
-        });
-        if (kind) params.set("kind", kind);
-        if (fmt) params.set("fmt", fmt);
+  if (!enTrack?.baseUrl) throw new Error("No caption URL");
 
-        const url = `https://video.google.com/timedtext?${params.toString()}`;
-        try {
-          const res = await fetch(url, {
-            headers: {
-              "User-Agent":
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            },
-          });
+  const res = await fetch(enTrack.baseUrl + "&fmt=json3", {
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
 
-          if (res.ok) {
-            const body = await res.text();
-            if (body.length > 100) {
-              if (body.startsWith("{")) {
-                return parseJson3Captions(body);
-              }
-              if (body.includes("<text")) {
-                return parseXmlCaptions(body);
-              }
-            }
-          }
-        } catch {
-          continue;
-        }
-      }
-    }
+  if (res.ok) {
+    const body = await res.text();
+    if (body.startsWith("{")) return parseJson3Captions(body);
   }
 
-  throw new Error("No captions available for this video");
+  const xmlRes = await fetch(enTrack.baseUrl, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
+  if (xmlRes.ok) {
+    const body = await xmlRes.text();
+    if (body.includes("<text")) return parseXmlCaptions(body);
+  }
+
+  throw new Error("Caption download failed - sign in with Google for better results");
 }
 
 export async function POST(request: NextRequest) {
@@ -179,23 +206,16 @@ export async function POST(request: NextRequest) {
     if (!url) {
       return NextResponse.json({ error: "URL is required" }, { status: 400 });
     }
-
     if (!YOUTUBE_API_KEY) {
       return NextResponse.json(
-        {
-          error:
-            "YouTube API key not configured. Set YOUTUBE_API_KEY in .env.local",
-        },
+        { error: "YouTube API key not configured" },
         { status: 500 }
       );
     }
 
     const videoId = extractVideoId(url);
     if (!videoId) {
-      return NextResponse.json(
-        { error: "Invalid YouTube URL" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Invalid YouTube URL" }, { status: 400 });
     }
 
     // Get video metadata via YouTube Data API v3
@@ -215,12 +235,43 @@ export async function POST(request: NextRequest) {
     const publishedAt = videoInfo.snippet?.publishedAt || "";
     const duration = videoInfo.contentDetails?.duration || "";
 
-    // Get transcript using multiple strategies
-    const transcript = await fetchCaptionText(videoId);
+    // Try to get OAuth session for authenticated caption fetching
+    let transcript = "";
+    const session = await getSession();
+
+    if (session?.access_token) {
+      let accessToken = session.access_token;
+
+      // Refresh token if expired
+      if (session.expiry_date && Date.now() > session.expiry_date && session.refresh_token) {
+        try {
+          const newCreds = await refreshAccessToken(session.refresh_token);
+          accessToken = newCreds.access_token || accessToken;
+        } catch {
+          // Use existing token
+        }
+      }
+
+      try {
+        transcript = await fetchCaptionWithAuth(videoId, accessToken);
+      } catch (authError) {
+        console.error("Auth caption fetch failed, trying unauthenticated:", authError);
+        // Fall through to unauthenticated
+      }
+    }
+
+    if (!transcript) {
+      try {
+        transcript = await fetchCaptionUnauthenticated(videoId);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : "Failed to get captions";
+        return NextResponse.json({ error: msg }, { status: 404 });
+      }
+    }
 
     if (!transcript || transcript.length === 0) {
       return NextResponse.json(
-        { error: "Captions returned empty for this video" },
+        { error: "Captions returned empty" },
         { status: 404 }
       );
     }

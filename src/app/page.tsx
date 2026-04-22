@@ -91,9 +91,17 @@ export default function KnowledgeBaseApp() {
   const [activeTab, setActiveTab] = useState<"urls" | "log">("urls");
   const [buildLog, setBuildLog] = useState<LogEntry[]>([]);
   const [isBuilding, setIsBuilding] = useState(false);
+  const [authStatus, setAuthStatus] = useState<{ authenticated: boolean; email?: string } | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
 
   const currentData = creatorData[selectedCreator.id];
+
+  useEffect(() => {
+    fetch("/api/auth/status")
+      .then((r) => r.json())
+      .then(setAuthStatus)
+      .catch(() => setAuthStatus({ authenticated: false }));
+  }, []);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -262,7 +270,7 @@ export default function KnowledgeBaseApp() {
             </div>
           </div>
         </div>
-        <div style={{ display: "flex", gap: "20px", fontSize: "12px" }}>
+        <div style={{ display: "flex", gap: "20px", fontSize: "12px", alignItems: "center" }}>
           {[
             { label: "URLs", value: totalUrlsAll },
             { label: "Transcripts", value: totalTranscriptsAll },
@@ -273,6 +281,31 @@ export default function KnowledgeBaseApp() {
               <div style={{ color: "#F0F6FC", fontWeight: 700, fontFamily: "var(--font-jetbrains), 'JetBrains Mono', monospace" }}>{stat.value}</div>
             </div>
           ))}
+          <div style={{ borderLeft: "1px solid #1E293B", paddingLeft: "16px", marginLeft: "4px" }}>
+            {authStatus?.authenticated ? (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <div style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#2EC4B6" }} />
+                <span style={{ color: "#8B9CB6", fontSize: "11px" }}>{authStatus.email}</span>
+                <button
+                  onClick={() => { fetch("/api/auth/logout", { method: "POST" }).then(() => window.location.reload()); }}
+                  style={{ background: "none", border: "none", color: "#5A6B7F", fontSize: "11px", cursor: "pointer", textDecoration: "underline" }}
+                >
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <a
+                href="/api/auth/login"
+                style={{
+                  padding: "6px 12px", borderRadius: "6px", border: "1px solid #1E293B",
+                  background: "#151D2E", color: "#C9D1D9", fontSize: "11px", fontWeight: 600,
+                  cursor: "pointer", textDecoration: "none",
+                }}
+              >
+                Sign in with Google
+              </a>
+            )}
+          </div>
         </div>
       </div>
 
