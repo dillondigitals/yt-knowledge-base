@@ -10,6 +10,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.91.1",
     "@netlify/plugin-nextjs": "^5.15.9",
     "googleapis": "^171.4.0",
     "next": "16.2.4",

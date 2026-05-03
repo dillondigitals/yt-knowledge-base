@@ -1,6 +1,9 @@
 import { google } from "googleapis";
 
-const SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"];
+const SCOPES = [
+  "https://www.googleapis.com/auth/youtube.readonly",
+  "https://www.googleapis.com/auth/drive.file",
+];
 
 export function createOAuth2Client() {
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";

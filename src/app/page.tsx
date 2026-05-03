@@ -13,11 +13,22 @@ interface Creator {
   photo: string;
 }
 
+interface TranscriptEntry {
+  videoId: string;
+  title: string;
+  channelTitle: string;
+  publishedAt: string;
+  url: string;
+  transcript: string;
+  charCount: number;
+}
+
 interface CreatorData {
   urls: string[];
   status: "idle" | "processing" | "done" | "error";
   transcripts: number;
   totalChars: number;
+  extractedTranscripts: TranscriptEntry[];
 }
 
 interface LogEntry {
@@ -76,52 +87,6 @@ function now() {
   return new Date().toLocaleTimeString();
 }
 
-const CAPTION_PROXY = process.env.NEXT_PUBLIC_CAPTION_PROXY || "";
-
-function decodeHtmlEntities(text: string): string {
-  return text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\n/g, " ").trim();
-}
-
-function parseJson3(body: string): string {
-  const data = JSON.parse(body);
-  const segs = data.events
-    ?.filter((e: { segs?: Array<{ utf8: string }> }) => e.segs)
-    .flatMap((e: { segs: Array<{ utf8: string }> }) => e.segs.map((s: { utf8: string }) => s.utf8))
-    .filter((t: string) => t && t.trim() !== "\n");
-  return (segs || []).join("").replace(/\n/g, " ").trim();
-}
-
-function parseXml(body: string): string {
-  const segs: string[] = [];
-  const re = /<text[^>]*>([\s\S]*?)<\/text>/g;
-  let m;
-  while ((m = re.exec(body)) !== null) {
-    const t = decodeHtmlEntities(m[1]);
-    if (t) segs.push(t);
-  }
-  return segs.join(" ");
-}
-
-async function fetchCaptionViaProxy(videoId: string): Promise<string> {
-  if (!CAPTION_PROXY) return "";
-  try {
-    const res = await fetch(`${CAPTION_PROXY}?v=${videoId}&lang=en`, {
-      credentials: "include",
-      redirect: "follow",
-    });
-    if (!res.ok) return "";
-    const data = await res.json();
-    if (data.error) return "";
-    const body = data.transcript || "";
-    if (body.length < 50) return "";
-    if (data.format === "json3" || body.startsWith("{")) return parseJson3(body);
-    if (body.includes("<text")) return parseXml(body);
-    return body;
-  } catch {
-    return "";
-  }
-}
-
 export default function KnowledgeBaseApp() {
   const [selectedCreator, setSelectedCreator] = useState<Creator>(CREATORS[0]);
   const [urlInput, setUrlInput] = useState("");
@@ -129,18 +94,138 @@ export default function KnowledgeBaseApp() {
     CREATORS.reduce(
       (acc, c) => ({
         ...acc,
-        [c.id]: { urls: [], status: "idle", transcripts: 0, totalChars: 0 },
+        [c.id]: { urls: [], status: "idle", transcripts: 0, totalChars: 0, extractedTranscripts: [] },
       }),
       {}
     )
   );
-  const [activeTab, setActiveTab] = useState<"urls" | "log">("urls");
+  const [activeTab, setActiveTab] = useState<"urls" | "log" | "document" | "chat">("urls");
   const [buildLog, setBuildLog] = useState<LogEntry[]>([]);
   const [isBuilding, setIsBuilding] = useState(false);
   const [authStatus, setAuthStatus] = useState<{ authenticated: boolean; email?: string } | null>(null);
+  const [chatMessages, setChatMessages] = useState<Array<{ role: "user" | "assistant"; content: string }>>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isChatting, setIsChatting] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
   const currentData = creatorData[selectedCreator.id];
+
+  const generateDocument = useCallback(() => {
+    const entries = currentData.extractedTranscripts;
+    if (entries.length === 0) return "";
+    const header = `# ${selectedCreator.name} — Complete Transcripts\n\nGenerated: ${new Date().toLocaleDateString()}\nTotal Videos: ${entries.length}\nTotal Characters: ${entries.reduce((s, e) => s + e.charCount, 0).toLocaleString()}\n\n---\n\n`;
+    const body = entries
+      .map(
+        (e, i) =>
+          `## ${i + 1}. ${e.title}\n\n**Channel:** ${e.channelTitle}\n**Published:** ${e.publishedAt ? new Date(e.publishedAt).toLocaleDateString() : "Unknown"}\n**URL:** ${e.url}\n**Characters:** ${e.charCount.toLocaleString()}\n\n${e.transcript}\n\n---\n\n`
+      )
+      .join("");
+    return header + body;
+  }, [currentData.extractedTranscripts, selectedCreator.name]);
+
+  const downloadDocument = useCallback(() => {
+    const doc = generateDocument();
+    if (!doc) return;
+    const blob = new Blob([doc], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${selectedCreator.name} — Complete Transcripts.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [generateDocument, selectedCreator.name]);
+
+  const copyDocument = useCallback(() => {
+    const doc = generateDocument();
+    if (!doc) return;
+    navigator.clipboard.writeText(doc);
+  }, [generateDocument]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages]);
+
+  const sendChat = useCallback(async () => {
+    if (!chatInput.trim() || isChatting) return;
+    const userMsg = chatInput.trim();
+    setChatInput("");
+    const newMessages = [...chatMessages, { role: "user" as const, content: userMsg }];
+    setChatMessages(newMessages);
+    setIsChatting(true);
+
+    // Build transcript context from extracted transcripts
+    const entries = currentData.extractedTranscripts;
+    let transcriptContext = "";
+    if (entries.length > 0) {
+      // Include as much as fits in context (truncate if needed)
+      for (const e of entries) {
+        const block = `\n### ${e.title}\nURL: ${e.url}\n\n${e.transcript}\n\n---\n`;
+        if (transcriptContext.length + block.length > 800000) break; // ~200K tokens limit
+        transcriptContext += block;
+      }
+    }
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: newMessages,
+          creatorName: selectedCreator.name,
+          transcriptContext,
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        setChatMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: `Error: ${err.error || "Failed to get response"}` },
+        ]);
+        setIsChatting(false);
+        return;
+      }
+
+      // Stream the response
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      let assistantMsg = "";
+      setChatMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value);
+          const lines = chunk.split("\n").filter((l) => l.startsWith("data: "));
+          for (const line of lines) {
+            const data = line.slice(6);
+            if (data === "[DONE]") break;
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.text) {
+                assistantMsg += parsed.text;
+                setChatMessages((prev) => {
+                  const updated = [...prev];
+                  updated[updated.length - 1] = { role: "assistant", content: assistantMsg };
+                  return updated;
+                });
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+    } catch {
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Error: Failed to connect to chat API" },
+      ]);
+    }
+    setIsChatting(false);
+  }, [chatInput, chatMessages, isChatting, currentData.extractedTranscripts, selectedCreator.name]);
 
   useEffect(() => {
     fetch("/api/auth/status")
@@ -195,6 +280,7 @@ export default function KnowledgeBaseApp() {
         status: "idle",
         transcripts: 0,
         totalChars: 0,
+        extractedTranscripts: [],
       },
     }));
     setBuildLog([]);
@@ -213,7 +299,7 @@ export default function KnowledgeBaseApp() {
 
     setCreatorData((prev) => ({
       ...prev,
-      [creatorId]: { ...prev[creatorId], status: "processing", transcripts: 0, totalChars: 0 },
+      [creatorId]: { ...prev[creatorId], status: "processing", transcripts: 0, totalChars: 0, extractedTranscripts: [] },
     }));
 
     setBuildLog([
@@ -232,25 +318,10 @@ export default function KnowledgeBaseApp() {
       }
       processed++;
       try {
-        // Extract video ID for proxy fetch
-        const vidMatch = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-        const videoId = vidMatch ? vidMatch[1] : "";
-
-        // Try browser-side proxy first (user's Google session)
-        let clientTranscript = "";
-        if (videoId && CAPTION_PROXY) {
-          clientTranscript = await fetchCaptionViaProxy(videoId);
-        }
-
-        // Send to server (with or without transcript)
         const res = await fetch("/api/transcript", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(
-            clientTranscript
-              ? { url, transcript: clientTranscript }
-              : { url }
-          ),
+          body: JSON.stringify({ url, creatorSlug: creatorId }),
         });
 
         const data = await res.json();
@@ -264,6 +335,27 @@ export default function KnowledgeBaseApp() {
         } else {
           const chars = data.transcript?.length || 0;
           totalChars += chars;
+          // Store the extracted transcript
+          if (data.transcript) {
+            setCreatorData((prev) => ({
+              ...prev,
+              [creatorId]: {
+                ...prev[creatorId],
+                extractedTranscripts: [
+                  ...prev[creatorId].extractedTranscripts,
+                  {
+                    videoId: data.videoId,
+                    title: data.title,
+                    channelTitle: data.channelTitle,
+                    publishedAt: data.publishedAt,
+                    url: data.url,
+                    transcript: data.transcript,
+                    charCount: chars,
+                  },
+                ],
+              },
+            }));
+          }
           setBuildLog((prev) => [
             ...prev,
             {
@@ -462,7 +554,7 @@ export default function KnowledgeBaseApp() {
 
           {/* Tabs */}
           <div style={{ display: "flex", gap: "0", borderBottom: "1px solid #1E293B" }}>
-            {(["urls", "log"] as const).map((tab) => (
+            {(["urls", "log", "document", "chat"] as const).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
@@ -475,7 +567,7 @@ export default function KnowledgeBaseApp() {
                   textTransform: "uppercase", letterSpacing: "0.05em",
                 }}
               >
-                {tab === "urls" ? `URLs (${currentData.urls.length})` : "Build Log"}
+                {tab === "urls" ? `URLs (${currentData.urls.length})` : tab === "log" ? "Build Log" : tab === "document" ? `Document (${currentData.extractedTranscripts.length})` : "Chat"}
               </button>
             ))}
           </div>
@@ -571,7 +663,7 @@ export default function KnowledgeBaseApp() {
                   </div>
                 )}
               </div>
-            ) : (
+            ) : activeTab === "log" ? (
               /* Build Log */
               <div style={{ padding: "16px 24px", fontFamily: "var(--font-jetbrains), 'JetBrains Mono', monospace", fontSize: "12px", lineHeight: "1.8" }}>
                 {buildLog.length === 0 ? (
@@ -594,6 +686,160 @@ export default function KnowledgeBaseApp() {
                   ))
                 )}
                 <div ref={logEndRef} />
+              </div>
+            ) : activeTab === "document" ? (
+              <div style={{ padding: "20px 24px" }}>
+                {currentData.extractedTranscripts.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: "48px 20px", color: "#3A4A5F" }}>
+                    <div style={{ fontSize: "14px", fontWeight: 500 }}>No transcripts extracted yet</div>
+                    <div style={{ fontSize: "12px", marginTop: "6px", color: "#2A3A4F" }}>
+                      Build the knowledge base first, then come here to download or copy
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ display: "flex", gap: "8px", marginBottom: "20px" }}>
+                      <button
+                        onClick={downloadDocument}
+                        style={{
+                          padding: "10px 20px", borderRadius: "8px", border: "none",
+                          background: selectedCreator.color, color: "#0B1120",
+                          fontSize: "13px", fontWeight: 700, cursor: "pointer",
+                        }}
+                      >
+                        Download as Markdown
+                      </button>
+                      <button
+                        onClick={copyDocument}
+                        style={{
+                          padding: "10px 20px", borderRadius: "8px",
+                          border: `1px solid ${selectedCreator.color}40`,
+                          background: `${selectedCreator.color}15`, color: selectedCreator.color,
+                          fontSize: "13px", fontWeight: 700, cursor: "pointer",
+                        }}
+                      >
+                        Copy to Clipboard
+                      </button>
+                    </div>
+                    <div style={{
+                      fontSize: "12px", color: "#5A6B7F", marginBottom: "16px",
+                      fontFamily: "var(--font-jetbrains), monospace",
+                    }}>
+                      {currentData.extractedTranscripts.length} transcripts &middot;{" "}
+                      {currentData.extractedTranscripts.reduce((s, e) => s + e.charCount, 0).toLocaleString()} total characters
+                    </div>
+                    <div style={{
+                      background: "#0D1525", border: "1px solid #1E293B", borderRadius: "8px",
+                      padding: "16px", maxHeight: "60vh", overflow: "auto",
+                      fontFamily: "var(--font-jetbrains), monospace", fontSize: "12px",
+                      lineHeight: "1.6", color: "#8B9CB6", whiteSpace: "pre-wrap",
+                    }}>
+                      {generateDocument()}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* Chat Tab */
+              <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+                <div style={{ flex: 1, overflow: "auto", padding: "20px 24px" }}>
+                  {chatMessages.length === 0 ? (
+                    <div style={{ textAlign: "center", padding: "48px 20px", color: "#3A4A5F" }}>
+                      <div style={{ fontSize: "20px", marginBottom: "8px" }}>{selectedCreator.initials}</div>
+                      <div style={{ fontSize: "14px", fontWeight: 500 }}>
+                        Chat with {selectedCreator.name}&apos;s Knowledge Base
+                      </div>
+                      <div style={{ fontSize: "12px", marginTop: "6px", color: "#2A3A4F" }}>
+                        {currentData.extractedTranscripts.length > 0
+                          ? `${currentData.extractedTranscripts.length} transcripts loaded as context`
+                          : "Build the knowledge base first, then chat here"}
+                      </div>
+                      {currentData.extractedTranscripts.length > 0 && (
+                        <div style={{ marginTop: "20px", display: "flex", flexWrap: "wrap", gap: "8px", justifyContent: "center" }}>
+                          {[
+                            `What are ${selectedCreator.name}'s core teachings?`,
+                            "What does he say about closing sales?",
+                            "Summarize the key frameworks across all videos",
+                            "What advice does he give about pricing?",
+                          ].map((q) => (
+                            <button
+                              key={q}
+                              onClick={() => { setChatInput(q); }}
+                              style={{
+                                padding: "6px 12px", borderRadius: "6px",
+                                border: "1px solid #1E293B", background: "#0D1525",
+                                color: "#8B9CB6", fontSize: "11px", cursor: "pointer",
+                              }}
+                            >
+                              {q}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    chatMessages.map((msg, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          marginBottom: "16px",
+                          display: "flex",
+                          flexDirection: "column",
+                          alignItems: msg.role === "user" ? "flex-end" : "flex-start",
+                        }}
+                      >
+                        <div style={{ fontSize: "10px", color: "#5A6B7F", marginBottom: "4px", textTransform: "uppercase" }}>
+                          {msg.role === "user" ? "You" : selectedCreator.name + " AI"}
+                        </div>
+                        <div
+                          style={{
+                            padding: "12px 16px",
+                            borderRadius: "12px",
+                            maxWidth: "80%",
+                            fontSize: "13px",
+                            lineHeight: "1.6",
+                            background: msg.role === "user" ? `${selectedCreator.color}20` : "#151D2E",
+                            border: `1px solid ${msg.role === "user" ? `${selectedCreator.color}30` : "#1E293B"}`,
+                            color: "#C9D1D9",
+                            whiteSpace: "pre-wrap",
+                          }}
+                        >
+                          {msg.content || (isChatting ? "..." : "")}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                  <div ref={chatEndRef} />
+                </div>
+                <div style={{
+                  borderTop: "1px solid #1E293B", padding: "12px 24px",
+                  display: "flex", gap: "8px",
+                }}>
+                  <input
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } }}
+                    placeholder={currentData.extractedTranscripts.length > 0 ? `Ask about ${selectedCreator.name}'s teachings...` : "Build knowledge base first..."}
+                    disabled={currentData.extractedTranscripts.length === 0}
+                    style={{
+                      flex: 1, padding: "10px 14px", borderRadius: "8px",
+                      border: "1px solid #1E293B", background: "#0D1525",
+                      color: "#C9D1D9", fontSize: "13px",
+                    }}
+                  />
+                  <button
+                    onClick={sendChat}
+                    disabled={!chatInput.trim() || isChatting || currentData.extractedTranscripts.length === 0}
+                    style={{
+                      padding: "10px 20px", borderRadius: "8px", border: "none",
+                      background: chatInput.trim() && !isChatting ? selectedCreator.color : "#1E293B",
+                      color: chatInput.trim() && !isChatting ? "#0B1120" : "#5A6B7F",
+                      fontSize: "13px", fontWeight: 700, cursor: chatInput.trim() && !isChatting ? "pointer" : "not-allowed",
+                    }}
+                  >
+                    {isChatting ? "..." : "Send"}
+                  </button>
+                </div>
               </div>
             )}
           </div>
