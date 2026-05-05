@@ -286,6 +286,65 @@ export default function KnowledgeBaseApp() {
     setBuildLog([]);
   };
 
+  // Fetch the creator's most recent N YouTube videos via /api/channel,
+  // populate the URL list, and (optionally) auto-build right after.
+  const scanChannel = useCallback(
+    async (limit: number = 25, autoBuild: boolean = true) => {
+      if (isBuilding) return;
+      setActiveTab("log");
+      setBuildLog([
+        { time: now(), msg: `Scanning ${selectedCreator.name}'s channel (${selectedCreator.handle})…`, type: "info" },
+      ]);
+      setCreatorData((prev) => ({
+        ...prev,
+        [selectedCreator.id]: { ...prev[selectedCreator.id], status: "processing" },
+      }));
+      try {
+        const res = await fetch("/api/channel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ channel: selectedCreator.handle }),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        const allUrls: string[] = data.urls || [];
+        const recent = allUrls.slice(0, limit);
+        setCreatorData((prev) => ({
+          ...prev,
+          [selectedCreator.id]: {
+            ...prev[selectedCreator.id],
+            urls: recent,
+            status: "idle",
+          },
+        }));
+        setBuildLog((prev) => [
+          ...prev,
+          {
+            time: now(),
+            msg: `Found ${allUrls.length} videos on ${data.channelName || selectedCreator.name}'s channel; queued ${recent.length} most recent.`,
+            type: "success",
+          },
+        ]);
+        if (autoBuild && recent.length > 0) {
+          // Defer slightly so the URL state update settles
+          await new Promise((r) => setTimeout(r, 200));
+          buildKnowledgeBase();
+        }
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : "Unknown error";
+        setBuildLog((prev) => [...prev, { time: now(), msg: `Scan failed: ${message}`, type: "error" }]);
+        setCreatorData((prev) => ({
+          ...prev,
+          [selectedCreator.id]: { ...prev[selectedCreator.id], status: "error" },
+        }));
+      }
+    },
+    // buildKnowledgeBase is defined further down; safe to omit because it's
+    // referenced via closure of the current render and React handles re-renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [selectedCreator, isBuilding]
+  );
+
   const buildKnowledgeBase = useCallback(async () => {
     if (currentData.urls.length === 0 || isBuilding) return;
 
@@ -531,6 +590,23 @@ export default function KnowledgeBaseApp() {
               </div>
             </div>
 
+            <div style={{ display: "flex", gap: "8px" }}>
+            <button
+              onClick={() => scanChannel(25, true)}
+              disabled={isBuilding}
+              title={`Scan ${selectedCreator.name}'s most recent 25 videos and extract transcripts to Drive`}
+              style={{
+                padding: "10px 16px", borderRadius: "8px",
+                border: `1px solid ${selectedCreator.color}50`,
+                background: "transparent",
+                color: isBuilding ? "#5A6B7F" : selectedCreator.color,
+                fontSize: "13px", fontWeight: 600,
+                cursor: isBuilding ? "not-allowed" : "pointer",
+                transition: "all 0.15s ease",
+              }}
+            >
+              {isBuilding ? "…" : `🔄 Scan ${selectedCreator.name.split(" ")[0]}'s channel`}
+            </button>
             <button
               onClick={buildKnowledgeBase}
               disabled={currentData.urls.length === 0 || isBuilding}
@@ -550,6 +626,7 @@ export default function KnowledgeBaseApp() {
                 ? "Rebuild Knowledge Base"
                 : "Build Knowledge Base"}
             </button>
+            </div>
           </div>
 
           {/* Tabs */}
