@@ -1,6 +1,18 @@
 import { google } from "googleapis";
+import { createHash } from "node:crypto";
 import { createOAuth2Client } from "./auth";
 import type { SessionData } from "./session";
+
+/**
+ * SHA-256 hex of a transcript's content. Used to detect duplicate uploads
+ * across the YT app AND the Telegram clarity-compass-agent transcript path.
+ * Stamped into Drive's per-file appProperties on every upload so future
+ * uploads (from either flow) can short-circuit if the same content is
+ * already in the library.
+ */
+function contentHash(text: string): string {
+  return createHash("sha256").update(String(text || ""), "utf8").digest("hex");
+}
 
 export function getDriveClient(session: SessionData) {
   const oauth = createOAuth2Client();
@@ -38,6 +50,8 @@ export interface SavedTranscript {
   fileName: string;
   webViewLink?: string | null;
   folderPath: string;
+  duplicate?: boolean;
+  duplicateOf?: string;
 }
 
 /**
@@ -69,6 +83,32 @@ export async function saveTranscriptToDrive(
     `\n---\n\n` +
     opts.transcript;
 
+  const hash = contentHash(opts.transcript);
+
+  // Cross-flow dedup: scan ALL files in the creator folder for a matching
+  // contentHash in appProperties. If found, short-circuit — this content was
+  // already uploaded (possibly via Telegram, possibly under a different name).
+  const allFiles = await drive.files.list({
+    q: `'${creatorFolderId}' in parents and trashed = false`,
+    fields: "files(id, name, webViewLink, appProperties)",
+    pageSize: 200,
+  });
+  const dup = (allFiles.data.files || []).find(
+    (f) => f.appProperties?.contentHash === hash
+  );
+  if (dup) {
+    return {
+      fileId: dup.id!,
+      fileName: dup.name!,
+      webViewLink: dup.webViewLink,
+      folderPath: `transcripts/${opts.creatorSlug}/${dup.name}`,
+      duplicate: true,
+      duplicateOf: dup.name!,
+    };
+  }
+
+  // Filename-based update path (existing YT-app behavior): same videoId
+  // overwrites in place — re-running extraction freshens the content.
   const existing = await drive.files.list({
     q: `'${creatorFolderId}' in parents and name = '${fileName}' and trashed = false`,
     fields: "files(id, name, webViewLink)",
@@ -78,6 +118,7 @@ export async function saveTranscriptToDrive(
     const fileId = existing.data.files[0].id!;
     await drive.files.update({
       fileId,
+      requestBody: { appProperties: { contentHash: hash, uploadSource: "ytapp" } },
       media: { mimeType: "text/plain", body },
     });
     return {
@@ -89,7 +130,12 @@ export async function saveTranscriptToDrive(
   }
 
   const created = await drive.files.create({
-    requestBody: { name: fileName, parents: [creatorFolderId], mimeType: "text/plain" },
+    requestBody: {
+      name: fileName,
+      parents: [creatorFolderId],
+      mimeType: "text/plain",
+      appProperties: { contentHash: hash, uploadSource: "ytapp" },
+    },
     media: { mimeType: "text/plain", body },
     fields: "id, name, webViewLink",
   });
