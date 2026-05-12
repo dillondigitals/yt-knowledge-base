@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { google } from "googleapis";
+import { google, youtube_v3 } from "googleapis";
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
 
@@ -23,43 +23,57 @@ export async function POST(request: NextRequest) {
 
     const youtube = google.youtube({ version: "v3", auth: YOUTUBE_API_KEY });
 
-    // Extract handle from various input formats
-    let handle = channel.trim();
-    if (handle.includes("youtube.com/")) {
-      const match = handle.match(/youtube\.com\/(@[\w.-]+)/);
-      if (match) handle = match[1];
-    }
-    if (handle.startsWith("@")) {
-      handle = handle.substring(1);
+    // Accept: bare handle, @handle, youtube.com/@handle, /channel/UC…, bare UC…,
+    // /user/Username (legacy), /c/CustomName (legacy).
+    // Quota: id/handle/username = 1 unit; customName falls back to search.list = 100 units.
+    const input = channel.trim();
+    const part = ["snippet", "contentDetails"];
+
+    const channelIdMatch = input.match(/youtube\.com\/channel\/(UC[\w-]{20,})/);
+    const handleUrlMatch = input.match(/youtube\.com\/(@[\w.-]+)/);
+    const userUrlMatch = input.match(/youtube\.com\/user\/([\w.-]+)/);
+    const customUrlMatch = input.match(/youtube\.com\/c\/([\w.-]+)/);
+
+    let listParams: youtube_v3.Params$Resource$Channels$List;
+    if (channelIdMatch) {
+      listParams = { part, id: [channelIdMatch[1]] };
+    } else if (/^UC[\w-]{20,}$/.test(input)) {
+      listParams = { part, id: [input] };
+    } else if (handleUrlMatch) {
+      listParams = { part, forHandle: handleUrlMatch[1].slice(1) };
+    } else if (userUrlMatch) {
+      listParams = { part, forUsername: userUrlMatch[1] };
+    } else if (customUrlMatch) {
+      // No cheap lookup for legacy /c/ URLs — resolve via search.list (100 units).
+      console.warn("Resolving /c/ URL via search.list — costs 100 quota units");
+      const searchRes = await youtube.search.list({
+        part: ["snippet"],
+        q: customUrlMatch[1],
+        type: ["channel"],
+        maxResults: 1,
+      });
+      const foundId = searchRes.data.items?.[0]?.snippet?.channelId;
+      if (!foundId) {
+        return NextResponse.json({ error: "Channel not found" }, { status: 404 });
+      }
+      listParams = { part, id: [foundId] };
+    } else {
+      listParams = { part, forHandle: input.startsWith("@") ? input.slice(1) : input };
     }
 
-    // Search for the channel by handle
-    const searchRes = await youtube.search.list({
-      part: ["snippet"],
-      q: handle,
-      type: ["channel"],
-      maxResults: 1,
-    });
+    const channelRes = await youtube.channels.list(listParams);
 
-    const channelResult = searchRes.data.items?.[0];
-    if (!channelResult?.snippet?.channelId) {
+    const channelData = channelRes.data.items?.[0];
+    if (!channelData?.id) {
       return NextResponse.json(
         { error: "Channel not found" },
         { status: 404 }
       );
     }
 
-    const channelId = channelResult.snippet.channelId;
-
-    // Get all video uploads from the channel
-    // First, get the uploads playlist ID
-    const channelRes = await youtube.channels.list({
-      part: ["contentDetails"],
-      id: [channelId],
-    });
-
+    const resolvedChannelId = channelData.id;
     const uploadsPlaylistId =
-      channelRes.data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+      channelData.contentDetails?.relatedPlaylists?.uploads;
 
     if (!uploadsPlaylistId) {
       return NextResponse.json(
@@ -99,8 +113,8 @@ export async function POST(request: NextRequest) {
     }
 
     return NextResponse.json({
-      channelId,
-      channelName: channelResult.snippet.title,
+      channelId: resolvedChannelId,
+      channelName: channelData.snippet?.title,
       urls,
       count: urls.length,
     });
